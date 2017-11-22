@@ -10,6 +10,7 @@ import (
 	"github.com/signalfx/metricproxy/protocol/carbon/metricdeconstructor"
 	"github.com/signalfx/metricproxy/protocol/collectd"
 	"github.com/signalfx/metricproxy/protocol/csv"
+	"github.com/signalfx/metricproxy/protocol/datadog"
 	"github.com/signalfx/metricproxy/protocol/prometheus"
 	"github.com/signalfx/metricproxy/protocol/signalfx"
 	"golang.org/x/net/context"
@@ -59,6 +60,12 @@ func NewLoader(ctx context.Context, logger log.Logger, version string, debugCont
 				httpChain:    next,
 			},
 			"prometheus": &prometheusLoader{
+				rootContext:  ctx,
+				debugContext: debugContext,
+				logger:       logger,
+				httpChain:    next,
+			},
+			"datadog": &datadogLoader{
 				rootContext:  ctx,
 				debugContext: debugContext,
 				logger:       logger,
@@ -136,6 +143,24 @@ type prometheusLoader struct {
 	debugContext *web.HeaderCtxFlag
 	httpChain    web.NextConstructor
 	logger       log.Logger
+}
+
+type datadogLoader struct {
+	rootContext  context.Context
+	debugContext *web.HeaderCtxFlag
+	httpChain    web.NextConstructor
+	logger       log.Logger
+}
+
+func (d *datadogLoader) Listener(sink dpsink.Sink, conf *ListenFrom) (protocol.Listener, error) {
+	sfConf := datadog.Config{
+		ListenAddr:      conf.ListenAddr,
+		Timeout:         conf.TimeoutDuration,
+		StartingContext: d.rootContext,
+		HTTPChain:       d.httpChain,
+		Logger:          d.logger,
+	}
+	return datadog.NewListener(sink, &sfConf)
 }
 
 func (p *prometheusLoader) Listener(sink dpsink.Sink, conf *ListenFrom) (protocol.Listener, error) {
