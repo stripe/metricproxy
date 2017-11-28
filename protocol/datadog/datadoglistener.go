@@ -1,6 +1,7 @@
 package datadog
 
 import (
+	"bytes"
 	"compress/zlib"
 	"encoding/json"
 	"fmt"
@@ -67,6 +68,7 @@ type decoder struct {
 	SendTo             dpsink.Sink
 	Logger             log.Logger
 	readAll            func(r io.Reader) ([]byte, error)
+	httpClient         *http.Client
 }
 
 func (d *decoder) getDatapoints(req *DDMetricsRequest) []*datapoint.Datapoint {
@@ -114,14 +116,12 @@ func (d *decoder) getDatapoints(req *DDMetricsRequest) []*datapoint.Datapoint {
 	return dps
 }
 
-func decodeBody(ctx context.Context, w http.ResponseWriter, r *http.Request) (io.ReadCloser, error) {
+func decodeBody(ctx context.Context, w http.ResponseWriter, r *http.Request, buff io.Writer) (io.ReadCloser, error) {
 	var (
 		body     io.ReadCloser
 		err      error
 		encoding = r.Header.Get("Content-Encoding")
 	)
-
-	// innerLogger := log.WithField("client", r.RemoteAddr)
 
 	switch encoding {
 	case "":
@@ -139,7 +139,9 @@ func decodeBody(ctx context.Context, w http.ResponseWriter, r *http.Request) (io
 		return nil, err
 	}
 
-	return body, nil
+	// Copy our body so we can pass it on to datadog, then wrap it in a
+	// NopCloser cuz we don't really need to close it.
+	return ioutil.NopCloser(io.TeeReader(body, buff)), nil
 }
 
 // ServeHTTPC decodes datapoints for the connection and sends them to the decoder's sink
@@ -156,7 +158,8 @@ func (d *decoder) ServeHTTPC(ctx context.Context, rw http.ResponseWriter, req *h
 
 	var ddMetrics DDMetricsRequest
 
-	body, err := decodeBody(ctx, rw, req)
+	var forDatadogBuff bytes.Buffer
+	body, err := decodeBody(ctx, rw, req, &forDatadogBuff)
 	if err != nil {
 		return
 	}
@@ -187,6 +190,9 @@ func (d *decoder) ServeHTTPC(ctx context.Context, rw http.ResponseWriter, req *h
 	}
 
 	rw.WriteHeader(http.StatusAccepted)
+
+	endpoint := fmt.Sprintf("https://app.datadoghq.com%s", req.URL.RequestURI())
+	SendToDatadog(d.httpClient, endpoint, forDatadogBuff)
 }
 
 // Datapoints about this decoder, including how many datapoints it decoded
@@ -232,9 +238,10 @@ func NewListener(sink dpsink.Sink, passedConf *Config) (*Server, error) {
 		fullHandler.Add(conf.HTTPChain)
 	}
 	decoder := decoder{
-		SendTo:  sink,
-		Logger:  conf.Logger,
-		readAll: ioutil.ReadAll,
+		SendTo:     sink,
+		Logger:     conf.Logger,
+		readAll:    ioutil.ReadAll,
+		httpClient: &http.Client{},
 	}
 	listenServer := Server{
 		listener: listener,
@@ -247,7 +254,8 @@ func NewListener(sink dpsink.Sink, passedConf *Config) (*Server, error) {
 		decoder: &decoder,
 		collector: sfxclient.NewMultiCollector(
 			metricTracking,
-			&decoder),
+			&decoder,
+		),
 	}
 	listenServer.SetupHealthCheck(conf.HealthCheck, r, conf.Logger)
 	httpHandler := web.NewHandler(conf.StartingContext, listenServer.decoder)
@@ -262,4 +270,31 @@ func NewListener(sink dpsink.Sink, passedConf *Config) (*Server, error) {
 // SetupDatadogPaths tells the router which paths the given handler should handle
 func SetupDatadogPaths(r *mux.Router, handler http.Handler) {
 	r.Path("/api/v1/series/").Methods("POST").Headers("Content-Type", "application/json").Handler(handler)
+}
+
+func SendToDatadog(httpClient *http.Client, endpoint string, body bytes.Buffer) {
+	var bodyBuffer bytes.Buffer
+
+	compressor := zlib.NewWriter(&bodyBuffer)
+	compressor.Write(body.Bytes())
+	compressor.Close() // TODO Check return
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, &bodyBuffer)
+	if err != nil {
+		fmt.Printf("TODO A THING %v\n", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "deflate")
+	// TODO Keepalive?
+	req.Close = true
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		fmt.Printf("TODO A THING %v\n", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		fmt.Printf("BAD STATUS TODO %d\n", resp.StatusCode)
+	}
 }
